@@ -28,6 +28,7 @@ import net.momirealms.sparrow.nbt.ListTag;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -727,6 +728,18 @@ public class CEChunk {
 
     public void setUnsaved(boolean unsaved) {
         this.unsaved = unsaved;
+    }
+
+    /** Saves on the owning thread, without clearing changes reported during serialization or I/O. */
+    public void save() throws IOException {
+        if (!this.isUnsaved()) return;
+        this.setUnsaved(false);
+        try {
+            this.world.worldDataStorage().writeChunkAt(this.chunkPos, this);
+        } catch (IOException | RuntimeException | Error failure) {
+            this.setUnsaved(true);
+            throw failure;
+        }
     }
 
     public boolean isEmpty() {

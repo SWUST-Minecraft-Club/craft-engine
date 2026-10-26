@@ -47,7 +47,7 @@ public abstract class AbstractBukkitExecutor implements PlatformExecutor {
 
     @Override
     public SchedulerTask runLater(Runnable r, long delay, net.momirealms.craftengine.core.world.World world, int x, int z) {
-        return runLater(r, delay, world == null ? null : (World) world.platformWorld(), 0, 0);
+        return runLater(r, delay, world == null ? null : (World) world.platformWorld(), x, z);
     }
 
     @Override

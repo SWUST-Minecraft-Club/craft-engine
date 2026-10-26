@@ -36,3 +36,4 @@ build/
 /server/
 /buildSrc/.kotlin/
 /target
+/dist/

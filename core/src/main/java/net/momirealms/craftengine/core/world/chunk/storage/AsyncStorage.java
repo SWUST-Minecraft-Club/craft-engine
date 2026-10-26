@@ -14,10 +14,13 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BiConsumer;
 
 public final class AsyncStorage implements WorldDataStorage {
     private static final int MAX_PENDING_WRITES = 256;
@@ -34,13 +37,28 @@ public final class AsyncStorage implements WorldDataStorage {
     }
 
     private final RegionStorage storage;
-    private final CompressionMethod compression;
+    private final ChunkEncoder encoder;
+    private final Executor executor;
+    private final BiConsumer<ChunkPos, Throwable> errorHandler;
     private final ConcurrentChainedLong2ReferenceHashTable<PendingWrite> pendingWrites = ConcurrentChainedLong2ReferenceHashTable.createWithCapacity(64);
     private final Object flushLock = new Object();
+    private final ReentrantReadWriteLock lifecycle = new ReentrantReadWriteLock();
+    private volatile boolean closed;
 
     public AsyncStorage(RegionStorage storage) {
+        this(storage, encoder(CompressionMethod.fromId(Config.compressionMethod())), WRITE_EXECUTOR,
+                (pos, failure) -> CraftEngine.instance().logger().warn("Failed to save chunk at " + pos, failure));
+    }
+
+    AsyncStorage(RegionStorage storage, ChunkEncoder encoder, Executor executor, BiConsumer<ChunkPos, Throwable> errorHandler) {
         this.storage = storage;
-        this.compression = CompressionMethod.fromId(Config.compressionMethod());
+        this.encoder = encoder;
+        this.executor = executor;
+        this.errorHandler = errorHandler;
+    }
+
+    private static ChunkEncoder encoder(CompressionMethod compression) {
+        return tag -> RegionFile.encodeChunkData(compression, tag);
     }
 
     @Override
@@ -50,7 +68,13 @@ public final class AsyncStorage implements WorldDataStorage {
 
     @Override
     public void writeSettings(WorldSettings settings) throws IOException {
-        this.storage.writeSettings(settings);
+        this.lifecycle.readLock().lock();
+        try {
+            if (this.closed) throw new IOException("Chunk storage is closed");
+            this.storage.writeSettings(settings);
+        } finally {
+            this.lifecycle.readLock().unlock();
+        }
     }
 
     @Override
@@ -85,23 +109,34 @@ public final class AsyncStorage implements WorldDataStorage {
     }
 
     @Override
-    public void writeChunkAt(@NotNull ChunkPos pos, @NotNull CEChunk chunk) {
+    public void writeChunkAt(@NotNull ChunkPos pos, @NotNull CEChunk chunk) throws IOException {
         // 序列化必须在调用线程上做，活区块数据不允许异步线程读取
         CompoundTag tag = DefaultChunkSerializer.serialize(chunk);
         submit(pos, tag, chunk);
     }
 
     @Override
-    public void writeChunkTagAt(@NotNull ChunkPos pos, @Nullable CompoundTag nbt) {
-        submit(pos, nbt, null);
+    public void writeChunkTagAt(@NotNull ChunkPos pos, @Nullable CompoundTag nbt) throws IOException {
+        submit(pos, nbt == null ? null : nbt.copy(), null);
     }
 
     @Override
-    public void clearChunkAt(@NotNull ChunkPos pos) {
+    public void clearChunkAt(@NotNull ChunkPos pos) throws IOException {
         submit(pos, null, null);
     }
 
-    private void submit(ChunkPos pos, @Nullable CompoundTag tag, @Nullable CEChunk chunk) {
+    private void submit(ChunkPos pos, @Nullable CompoundTag tag, @Nullable CEChunk chunk) throws IOException {
+        this.lifecycle.readLock().lock();
+        try {
+            this.enqueue(pos, tag, chunk);
+        } finally {
+            this.lifecycle.readLock().unlock();
+        }
+        applyBackpressure();
+    }
+
+    private void enqueue(ChunkPos pos, @Nullable CompoundTag tag, @Nullable CEChunk chunk) throws IOException {
+        if (this.closed) throw new IOException("Chunk storage is closed");
         long key = pos.longKey;
         PendingWrite pending;
         boolean schedule = false;
@@ -113,6 +148,7 @@ public final class AsyncStorage implements WorldDataStorage {
                     continue;
                 }
                 pending.tag = tag;
+                pending.failure = null;
                 if (chunk != null) {
                     pending.chunk = chunk;
                 }
@@ -124,45 +160,64 @@ public final class AsyncStorage implements WorldDataStorage {
             break;
         }
         if (schedule) {
-            PendingWrite task = pending;
-            WRITE_EXECUTOR.execute(() -> runWrite(key, task));
+            this.scheduleWrite(key, pending);
         }
-        applyBackpressure();
+    }
+
+    private void scheduleWrite(long key, PendingWrite pending) throws IOException {
+        try {
+            this.executor.execute(() -> runWrite(key, pending));
+        } catch (RuntimeException failure) {
+            synchronized (pending) {
+                pending.running = false;
+                pending.failure = new IOException("Failed to schedule chunk write at " + pending.pos, failure);
+                if (pending.chunk != null) pending.chunk.setUnsaved(true);
+            }
+            this.signalWrites();
+            throw new IOException("Chunk IO executor rejected a write", failure);
+        }
     }
 
     private void runWrite(long key, PendingWrite pending) {
-        CompoundTag tag;
-        synchronized (pending) {
-            tag = pending.tag;
-        }
-        try {
-            if (tag == null) {
-                this.storage.clearChunkAt(pending.pos);
-            } else {
-                byte[] data = RegionFile.encodeChunkData(this.compression, tag);
-                this.storage.writeChunkDataAt(pending.pos, data);
-            }
-        } catch (Throwable t) {
-            CEChunk chunk;
+        while (true) {
+            CompoundTag tag;
             synchronized (pending) {
-                chunk = pending.chunk;
+                tag = pending.tag;
             }
-            // 回置脏标记，让下一轮保存重试，避免静默丢数据
-            if (chunk != null) {
-                chunk.setUnsaved(true);
+            try {
+                if (tag == null) {
+                    this.storage.clearChunkAt(pending.pos);
+                } else {
+                    this.storage.writeChunkDataAt(pending.pos, this.encoder.encode(tag));
+                }
+            } catch (Throwable failure) {
+                synchronized (pending) {
+                    if (pending.tag == tag) {
+                        pending.failure = new IOException("Failed to save chunk at " + pending.pos, failure);
+                    }
+                    if (pending.chunk != null) pending.chunk.setUnsaved(true);
+                }
+                try {
+                    this.errorHandler.accept(pending.pos, failure);
+                } catch (Throwable loggingFailure) {
+                    failure.addSuppressed(loggingFailure);
+                }
             }
-            CraftEngine.instance().logger().warn("Failed to save chunk at " + pending.pos, t);
+            synchronized (pending) {
+                // A newer snapshot arrived while writing; persist it before completing this task.
+                if (pending.tag != tag) continue;
+                pending.running = false;
+                if (pending.failure == null) {
+                    pending.completed = true;
+                    this.pendingWrites.remove(key, pending);
+                }
+            }
+            this.signalWrites();
+            return;
         }
-        synchronized (pending) {
-            if (pending.tag != tag) {
-                // 写入期间来了新数据，带着最新数据重跑
-                WRITE_EXECUTOR.execute(() -> runWrite(key, pending));
-                return;
-            }
-            pending.running = false;
-            pending.completed = true;
-            this.pendingWrites.remove(key, pending);
-        }
+    }
+
+    private void signalWrites() {
         synchronized (this.flushLock) {
             this.flushLock.notifyAll();
         }
@@ -173,6 +228,8 @@ public final class AsyncStorage implements WorldDataStorage {
         long start = System.currentTimeMillis();
         boolean warned = false;
         while (this.pendingWrites.size() >= MAX_PENDING_WRITES) {
+            // A failed write stays readable and retryable; waiting for its removal would deadlock.
+            if (this.hasFailedWrite()) return;
             synchronized (this.flushLock) {
                 try {
                     this.flushLock.wait(50L);
@@ -188,15 +245,49 @@ public final class AsyncStorage implements WorldDataStorage {
         }
     }
 
-    private void awaitPendingWrites() {
+    private boolean hasFailedWrite() {
+        for (var entry : this.pendingWrites.entrySet()) {
+            synchronized (entry.getValue()) {
+                if (entry.getValue().failure != null) return true;
+            }
+        }
+        return false;
+    }
+
+    private void retryFailedWrites() throws IOException {
+        for (var entry : this.pendingWrites.entrySet()) {
+            PendingWrite pending = entry.getValue();
+            synchronized (pending) {
+                if (pending.running || pending.completed || pending.failure == null) continue;
+                pending.failure = null;
+                pending.running = true;
+            }
+            this.scheduleWrite(entry.getKey(), pending);
+        }
+    }
+
+    private void awaitPendingWrites() throws IOException {
         while (!this.pendingWrites.isEmpty()) {
+            IOException failure = null;
+            boolean running = false;
+            for (var entry : this.pendingWrites.entrySet()) {
+                PendingWrite pending = entry.getValue();
+                synchronized (pending) {
+                    running |= pending.running;
+                    if (pending.failure != null) {
+                        if (failure == null) failure = new IOException("Chunk writes have not reached disk");
+                        failure.addSuppressed(pending.failure);
+                    }
+                }
+            }
+            if (!running && failure != null) throw failure;
             synchronized (this.flushLock) {
                 if (this.pendingWrites.isEmpty()) break;
                 try {
                     this.flushLock.wait(100L);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    return;
+                    throw new IOException("Interrupted while waiting for chunk writes", e);
                 }
             }
         }
@@ -204,14 +295,33 @@ public final class AsyncStorage implements WorldDataStorage {
 
     @Override
     public void flush() throws IOException {
-        this.awaitPendingWrites();
-        this.storage.flush();
+        this.lifecycle.readLock().lock();
+        try {
+            if (this.closed) return;
+            this.retryFailedWrites();
+            this.awaitPendingWrites();
+            this.storage.flush();
+        } finally {
+            this.lifecycle.readLock().unlock();
+        }
     }
 
     @Override
     public void close() throws IOException {
-        this.awaitPendingWrites();
-        this.storage.close();
+        this.lifecycle.writeLock().lock();
+        try {
+            if (this.closed) return;
+            this.flush();
+            this.storage.close();
+            this.closed = true;
+        } finally {
+            this.lifecycle.writeLock().unlock();
+        }
+    }
+
+    @FunctionalInterface
+    interface ChunkEncoder {
+        byte[] encode(CompoundTag tag) throws IOException;
     }
 
     private static final class PendingWrite {
@@ -220,6 +330,7 @@ public final class AsyncStorage implements WorldDataStorage {
         @Nullable CEChunk chunk;    // 用于写失败时回置脏标记
         boolean running;
         boolean completed;
+        @Nullable IOException failure;
 
         PendingWrite(ChunkPos pos) {
             this.pos = pos;

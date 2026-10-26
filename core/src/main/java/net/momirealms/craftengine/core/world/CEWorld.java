@@ -98,16 +98,12 @@ public abstract class CEWorld {
     }
 
     public void saveChunks() {
-        try {
-            for (ConcurrentChainedLong2ReferenceHashTable.TableEntry<CEChunk> entry : this.loadedChunkMap.entrySet()) {
-                CEChunk chunk = entry.getValue();
-                if (chunk.isUnsaved()) {
-                    this.worldDataStorage.writeChunkAt(new ChunkPos(entry.getKey()), chunk);
-                    chunk.setUnsaved(false);
-                }
+        for (ConcurrentChainedLong2ReferenceHashTable.TableEntry<CEChunk> entry : this.loadedChunkMap.entrySet()) {
+            try {
+                entry.getValue().save();
+            } catch (IOException | RuntimeException e) {
+                CraftEngine.instance().logger().warn("Failed to save chunk " + new ChunkPos(entry.getKey()) + " in " + this.name(), e);
             }
-        } catch (IOException e) {
-            CraftEngine.instance().logger().warn("Failed to save world chunks", e);
         }
     }
 

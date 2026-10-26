@@ -1,6 +1,7 @@
 package net.momirealms.craftengine.bukkit.world;
 
 import net.momirealms.craftengine.bukkit.plugin.BukkitCraftEngine;
+import net.momirealms.craftengine.bukkit.util.ServerUtils;
 import net.momirealms.craftengine.bukkit.world.chunk.FoliaCEChunk;
 import net.momirealms.craftengine.core.util.TickersList;
 import net.momirealms.craftengine.core.world.ChunkPos;
@@ -8,6 +9,9 @@ import net.momirealms.craftengine.core.world.World;
 import net.momirealms.craftengine.core.world.chunk.CEChunk;
 import net.momirealms.craftengine.core.world.chunk.storage.StorageAdaptor;
 import net.momirealms.craftengine.core.world.chunk.storage.WorldDataStorage;
+import org.bukkit.Bukkit;
+
+import java.io.IOException;
 
 import java.util.Map;
 import java.util.Queue;
@@ -27,6 +31,34 @@ public final class FoliaCEWorld extends BukkitCEWorld {
         super(world, dataStorage);
     }
 
+    @Override
+    public void saveChunks() {
+        // Shutdown runs after the region tick threads have stopped. During normal operation each
+        // chunk's block entities must be serialized on its owning region, including /save-all.
+        if (!ServerUtils.isRunning()) {
+            super.saveChunks();
+            return;
+        }
+        org.bukkit.World bukkitWorld = (org.bukkit.World) this.world.platformWorld();
+        for (var entry : this.loadedChunkMap.entrySet()) {
+            CEChunk chunk = entry.getValue();
+            ChunkPos pos = chunk.chunkPos();
+            Runnable save = () -> {
+                if (this.getChunkAtIfLoaded(pos) != chunk || !chunk.isLoaded()) return;
+                try {
+                    chunk.save();
+                } catch (IOException | RuntimeException failure) {
+                    BukkitCraftEngine.instance().logger().warn("Failed to save chunk " + pos + " in " + this.name(), failure);
+                }
+            };
+            if (Bukkit.isOwnedByCurrentRegion(bukkitWorld, pos.x, pos.z)) {
+                save.run();
+            } else {
+                BukkitCraftEngine.instance().scheduler().platform().run(save, this.world, pos.x, pos.z);
+            }
+        }
+    }
+
     public void syncTick() {
         this.updateLight();
 
@@ -44,7 +76,7 @@ public final class FoliaCEWorld extends BukkitCEWorld {
                     BukkitCraftEngine.instance().scheduler().platform().run(chunk::tick, this.world, chunkPos.x, chunkPos.z);
                 } else {
                     this.tickingChunks.markAsRemoved(i);
-                    this.tickingChunkByPos.remove(chunk.chunkPos());
+                    this.tickingChunkByPos.remove(chunk.chunkPos(), chunk);
                 }
             }
             this.tickingChunks.removeMarkedEntries();
@@ -75,7 +107,7 @@ public final class FoliaCEWorld extends BukkitCEWorld {
         }
 
         public void tick() {
-            this.chunk.tickBlockEntities();
+            if (this.isValid()) this.chunk.tickBlockEntities();
         }
 
         public boolean isValid() {

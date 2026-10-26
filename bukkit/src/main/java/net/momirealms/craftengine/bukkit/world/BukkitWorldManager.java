@@ -382,6 +382,7 @@ public final class BukkitWorldManager implements WorldManager, Listener {
                 this.plugin.logger().warn("Failed to unload chunk " + chunk.getX() + "," + chunk.getZ(), t);
             }
         }
+        ceWorld.saveSettings();
         try {
             ceWorld.worldDataStorage().close();
         } catch (IOException e) {
@@ -528,8 +529,7 @@ public final class BukkitWorldManager implements WorldManager, Listener {
         if (ceChunk != null) {
             if (ceChunk.isUnsaved()) {
                 try {
-                    world.worldDataStorage().writeChunkAt(pos, ceChunk);
-                    ceChunk.setUnsaved(false);
+                    ceChunk.save();
                 } catch (IOException e) {
                     this.plugin.logger().warn("Failed to write chunk tag at " + chunk.getX() + " " + chunk.getZ(), e);
                 }
@@ -614,8 +614,7 @@ public final class BukkitWorldManager implements WorldManager, Listener {
             return () -> {
                 try {
                     if (ceChunk.isUnsaved()) {
-                        ceWorld.worldDataStorage().writeChunkAt(chunkPos, ceChunk);
-                        ceChunk.setUnsaved(false);
+                        ceChunk.save();
                     }
                 } catch (IOException e) {
                     this.plugin.logger().warn("Failed to write chunk [world=" + ceWorld.name() +

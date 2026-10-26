@@ -1,0 +1,115 @@
+name: Build and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build:
+    name: Test and build plugins
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Read version and validate release tag
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          version = next(line.split('=', 1)[1].strip() for line in Path('gradle.properties').read_text().splitlines() if line.startswith('project_version='))
+          if os.environ['GITHUB_REF_TYPE'] == 'tag' and os.environ['GITHUB_REF_NAME'] != f'v{version}':
+              raise SystemExit(f'Release tag must be v{version}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+
+      - name: Configure build metadata
+        run: git config user.name 'github-actions[bot]'
+
+      - name: Test and build Paper and Bukkit plugins
+        run: >-
+          ./gradlew :core:test :bukkit:paper-loader:shadowJar :bukkit:loader:shadowJar
+          --no-daemon --stacktrace --console=plain --max-workers=2
+          -Dorg.gradle.jvmargs=-Xmx3G
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-results
+          path: |
+            core/build/reports/tests/test/
+            core/build/test-results/test/
+          if-no-files-found: ignore
+
+      - name: Prepare release assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          cp "target/craft-engine-paper-plugin-${VERSION}.jar" dist/
+          cp "target/craft-engine-bukkit-plugin-${VERSION}.jar" dist/
+          cp docs/RELEASING.md dist/RELEASING.md
+          cd dist
+          sha256sum ./*.jar > SHA256SUMS.txt
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Publish or update release assets
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum --check SHA256SUMS.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" ./*.jar SHA256SUMS.txt RELEASING.md --clobber
+          else
+            gh release create "$TAG" ./*.jar SHA256SUMS.txt RELEASING.md \
+              --verify-tag --title "CraftEngine $TAG" --generate-notes \
+              --notes 'Folia 26.3 请使用 craft-engine-paper-plugin JAR。Paper 与 Bukkit 版本二选一安装；材质混淆配置及本次修复说明见附件 RELEASING.md。'
+          fi

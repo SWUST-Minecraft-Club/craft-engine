@@ -94,6 +94,14 @@ resource-pack:
   # Cache the resource files in memory to speed up pack generation.
   cache-resource-files: true
 
+  # Rename custom block/item texture paths in the ZIP and update their JSON references.
+  # This increases extraction effort; clients still receive the images. Source packs are untouched.
+  # Packs containing OptiFine/MCPatcher/custom-namespace shaders are conservatively skipped.
+  texture-obfuscation:
+    enable: false
+    seed: 0 # 0 = random each ZIP; a nonzero seed keeps filenames stable
+    exclude: [] # Resource ID prefixes, e.g. ["farmersdelight:item/knife"]
+
   # Remove 1.21.5+ tinted_leaves particles
   remove-tinted-leaves-particle: true
   # Should those images in minecraft:default font also work in minecraft:uniform

@@ -871,7 +871,20 @@ public abstract class AbstractPackManager implements PackManager {
         // Upload only a complete result, keeping a previous successful file intact if writing fails.
         Path temporary = Files.createTempFile(output.toAbsolutePath().getParent(), ".pack-", ".zip");
         try {
-            writer.generate(new PackZipRequest(pack.path(), temporary, protection, storePng));
+            var settings = YamlUtils.reader(Config.instance().settings());
+            if (settings.getBoolean("resource-pack.texture-obfuscation.enable", false)) {
+                try (FileSystem copy = Jimfs.newFileSystem(Configuration.forCurrentPlatform())) {
+                    Path root = copy.getPath("resource_pack").toAbsolutePath();
+                    pack.export(root);
+                    var mapping = net.momirealms.craftengine.core.pack.obfuscation.TextureObfuscator.apply(root,
+                            settings.getLong("resource-pack.texture-obfuscation.seed", 0),
+                            settings.getStringList("resource-pack.texture-obfuscation.exclude"));
+                    this.plugin.logger().info("Obfuscated " + mapping.size() + " custom texture paths");
+                    writer.generate(new PackZipRequest(root, temporary, protection, storePng));
+                }
+            } else {
+                writer.generate(new PackZipRequest(pack.path(), temporary, protection, storePng));
+            }
             if (Files.size(temporary) == 0) throw new IOException("No resource pack was written: " + output);
             Files.move(temporary, output, StandardCopyOption.REPLACE_EXISTING);
         } finally {
